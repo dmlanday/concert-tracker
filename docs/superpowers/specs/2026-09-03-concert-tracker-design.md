@@ -142,10 +142,11 @@ most-heard songs, first and most recent show.
 
 ### 4.2 Consequences
 
-The daily quota rules out any per-page-view call. All Setlist.fm access happens
-only while a user is actively searching to add a show, and every result is
-copied into our own tables. Rendering a concert page, a profile, a feed, or a
-stats page issues zero external calls.
+The daily quota rules out any per-page-view call. Setlist.fm is contacted from
+exactly two places: an interactive search while a user is adding a show, and a
+budgeted background refresh job (4.6). Every result is copied into our own
+tables. Rendering a concert page, a profile, a feed, or a stats page issues zero
+external calls.
 
 The key lives in a server-side environment variable and is never sent to the
 browser, both because their terms forbid sharing it and because a leaked key
@@ -168,6 +169,10 @@ lets strangers exhaust the app's quota.
 
 - Token bucket limiter at 2 requests/second, plus a daily counter, enforced
   in-process so the app degrades deliberately instead of collecting 429s.
+- The daily quota is split into two named budgets, `interactive` and `refresh`,
+  with the refresh budget capped at 20 percent. Every call declares which budget
+  it draws from. This guarantees the background job can never starve a user who
+  is trying to add a show, which is the failure that would actually matter.
 - Short-lived cache keyed on the search parameters, since several users looking
   up the same tour on the same evening is the common case.
 - A dedicated, unit-tested `dd-MM-yyyy` formatting helper. Passing an ISO date
@@ -183,10 +188,40 @@ the `(artistId, venueId, date)` unique constraint.
 
 ### 4.6 Freshness and attribution
 
-Setlists get edited on Setlist.fm after the fact. Every imported setlist stores
-`setlistfmVersionId` and `lastSyncedAt`, and renders a manual "refresh setlist"
-button. There is no background sync: polling for updates is the one pattern
-guaranteed to consume the entire daily quota for no user-visible benefit.
+Setlists get edited on Setlist.fm after the fact, most heavily in the days right
+after a show while attendees correct the song order. A setlist that never
+updates therefore tends to be wrong exactly when people are looking at it. So
+setlists are refreshed, but on a strict budget rather than by naive polling.
+
+Every Concert stores `setlistfmVersionId` and `lastSyncedAt`. Refresh happens
+three ways:
+
+1. **Manual.** A "refresh setlist" button on any imported concert, drawing from
+   the `interactive` budget, rate limited per concert to once every 15 minutes
+   so it cannot be used to drain the quota.
+2. **Scheduled, budgeted, and prioritized.** A daily job spends at most the
+   `refresh` budget from 4.4 (20 percent of the daily quota, roughly 288 calls
+   on a starter key). It selects concerts by a decay rule rather than by
+   scanning everything: a show is eligible daily for its first week after the
+   event date, weekly until one month out, and never again automatically.
+   Within the eligible set it orders by attendee count descending, then by
+   oldest `lastSyncedAt`, so the quota is spent on the setlists the most people
+   are actually reading.
+3. **Never on render.** No page view triggers a refresh, and no cache miss
+   triggers one. Section 4.2 still holds.
+
+Because the decay rule stops at one month, the steady-state cost is bounded by
+how many shows the site logs per week, not by how many concerts exist in total.
+That is the property that makes this safe as the database grows, and it is the
+reason to prefer it over a "refresh anything older than N days" sweep, which
+grows without limit.
+
+If a refresh finds an unchanged `setlistfmVersionId`, nothing is written and
+only `lastSyncedAt` advances. If the version changed, songs are replaced in a
+single transaction so a concert page never renders a half-written setlist. If
+the setlist was deleted upstream, the local copy is retained and flagged stale
+rather than destroyed, because a user's attendance record should not lose its
+setlist due to someone else's edit.
 
 Every imported setlist renders a visible "Source: setlist.fm" link back to the
 original page, as their terms require.
@@ -245,9 +280,33 @@ pointing at a missing object.
 
 ### 5.4 Serving and limits
 
-Storage keys are random and unguessable, the bucket is public-read, and a CDN
-sits in front. Signed URLs are rejected for v1: they add latency and defeat CDN
-caching to protect content that is already on a public profile.
+**The bucket is private. There is no public-read access and no anonymous object
+URL.** Unguessable keys are obfuscation, not access control: once such a URL
+leaks into a referrer header, a screenshot, a shared link, or a search index, it
+is public permanently and cannot be revoked without deleting the file. Photos of
+identifiable people at identifiable places and times deserve better than that.
+
+Instead, the app issues **short-lived signed URLs**, generated server-side at
+render time by the storage driver's `urlFor`. Two details make this practical
+rather than a performance regression:
+
+- **Expiry is rounded, not exact.** A signed URL is issued with an expiry
+  snapped up to the next 10 minute boundary, so every viewer of the same photo
+  within that window receives a byte-identical URL. The CDN therefore still gets
+  a stable cache key and a high hit rate, which is the objection that would
+  otherwise sink signed URLs. Effective TTL is between 10 and 20 minutes.
+- **Signing is local and cheap.** Signature generation is an HMAC over the key
+  and expiry with no network round trip, so it costs microseconds per photo and
+  adds nothing to page latency.
+
+This also removes the blocker on private profiles. Access can later become a
+real authorization check inside `urlFor` without re-uploading a single object or
+changing any storage layout, which would have been impossible on a public
+bucket.
+
+The local disk driver mirrors this: `urlFor` returns a path with the same signed
+query parameters, verified by the development file route, so signing is
+exercised in local development rather than only in production.
 
 Limits: 30 photos per show, 20 MB per file, accepted input types JPEG, PNG,
 WebP, and HEIC.
@@ -273,7 +332,7 @@ audit. A hidden UI control is not an access control.
 | `/` | Feed of followed users' shows when signed in, marketing page otherwise |
 | `/u/[handle]` | Public profile: that user's shows plus a stats strip |
 | `/u/[handle]/shows/[id]` | One logged show: notes, photo gallery, setlist, comments |
-| `/shows/[id]` | Canonical concert: setlist, all attendees, all public photos from that night |
+| `/shows/[id]` | Canonical concert: setlist, all attendees, all photos from that night |
 | `/add` | Setlist.fm search and import, with manual fallback |
 | `/artists/[id]` | Artist page with their concerts |
 | `/venues/[id]` | Venue page with its concerts |
@@ -311,6 +370,12 @@ Tests are written before implementation, per the normal development workflow.
 - Concert dedup and upsert behavior
 - EXIF stripping (assert no GPS tags survive)
 - Both storage drivers against the same interface contract
+- Signed URL expiry rounding: two calls inside the same 10 minute window must
+  produce identical URLs, and one past the boundary must not. This is what
+  protects the CDN hit rate, and it would regress silently.
+- The refresh eligibility rule: a show inside its first week is selected daily,
+  one at five weeks is never selected, and the job stops once the refresh budget
+  is spent rather than continuing into the interactive budget.
 
 **Integration** against a real PostgreSQL in Docker for the import and dedup
 path, because that logic lives mostly in database constraints and mocking them
@@ -346,9 +411,13 @@ additive and can be resequenced or dropped without rework.
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth |
 | `EMAIL_SERVER`, `EMAIL_FROM` | Magic link delivery |
 | `SETLISTFM_API_KEY` | Setlist.fm, server-side only |
+| `SETLISTFM_DAILY_QUOTA` | Total daily call budget, default 1440, raised if a higher tier key is granted |
+| `SETLISTFM_REFRESH_BUDGET_PCT` | Share of the quota the refresh job may spend, default 20 |
+| `CRON_SECRET` | Shared secret authenticating the scheduled refresh and staging sweep endpoints |
 | `STORAGE_DRIVER` | `s3` or `local` |
-| `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | Object storage |
-| `PUBLIC_ASSET_BASE_URL` | CDN origin for serving photos |
+| `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | Object storage, private bucket |
+| `ASSET_BASE_URL` | CDN origin fronting the private bucket |
+| `ASSET_URL_TTL_SECONDS` | Signed URL lifetime, default 600, rounded up per 5.4 |
 
 ## 12. Open items for the implementer
 
@@ -357,3 +426,8 @@ None blocking. Two decisions deliberately deferred:
 1. Precomputed stats counters, deferred until a query is measured as slow.
 2. Venue latitude and longitude are stored but unused; a map view is out of
    scope for v1.
+
+Private profiles remain out of scope for v1, but 5.4 deliberately leaves the
+door open: because photos are served through signed URLs from a private bucket,
+adding an authorization check later is a change inside `urlFor` rather than a
+migration of every stored object.
