@@ -19,10 +19,12 @@ Success criteria:
    setlist, not two disconnected copies.
 4. The site renders every public page without making a single call to
    Setlist.fm.
+5. A user who attended a festival or a show with openers logs the night once and
+   records which acts they actually saw, rather than filing three unrelated
+   entries.
 
 Non-goals for this design: native mobile apps, ticket purchasing, private or
-follower-only profiles, real-time notifications, and multi-artist festival
-events as first-class objects (see 3.4).
+follower-only profiles, and real-time notifications.
 
 ## 2. Stack
 
@@ -47,10 +49,15 @@ revisiting only if a native client is actually built.
 
 ### 3.1 Principle
 
-A concert is a shared object, not a personal note. Personal content (notes,
-photos, rating) hangs off a per-user `Attendance` row that points at the shared
-`Concert`. This is what makes "9 other people were at this show" possible,
-prevents duplicate setlist imports, and makes cross-user stats meaningful.
+A show is a shared object, not a personal note. Personal content (notes, photos,
+rating) hangs off a per-user `Attendance` row pointing at shared canonical rows.
+This is what makes "9 other people were here" possible, prevents duplicate
+setlist imports, and makes cross-user stats meaningful.
+
+The second principle is that **a night out and a set played are different
+things**. You attend a night. An artist plays a set. Conflating them is what
+makes festivals and opening acts awkward in most tracking apps, so the model
+separates them from the start.
 
 ### 3.2 Canonical layer
 
@@ -65,47 +72,84 @@ Written mostly by imports, deduplicated, shared by all users.
 - `setlistfmVenueId` (nullable, unique)
 - `lat`, `lng` (nullable, reserved for a future map; not used in v1)
 
-**Concert**
-- `id`, `artistId`, `venueId`, `date` (date, no time)
-- `tourName` (nullable), `eventName` (nullable, see 3.4)
+**Event** (one night at one venue)
+- `id`, `venueId`, `date` (date, no time)
+- `name` (nullable, for example "Bonnaroo 2026, Day 2")
+- `festivalName` (nullable, groups the days of one festival together)
+- Unique constraint on `(venueId, date)`
+
+**Performance** (one artist's set at one Event)
+- `id`, `eventId`, `artistId`
+- `billing` (enum: `headliner`, `support`, `unknown`)
+- `setOrder` (nullable int, position in the lineup)
+- `tourName` (nullable)
 - `setlistfmId` (nullable, unique)
 - `setlistfmVersionId` (nullable), `lastSyncedAt` (nullable)
-- Unique constraint on `(artistId, venueId, date)`
+- Unique constraint on `(eventId, artistId)`
 
-The second unique constraint is load-bearing: it makes a manually entered show
-and a later Setlist.fm import of the same show collapse into one row rather than
-forking into two.
+Two load-bearing constraints. `Event` unique on `(venueId, date)` is what makes
+festivals work with no special cases: when the second person imports a different
+act from the same night, the upsert finds the existing Event and attaches a new
+Performance to it. The lineup assembles itself out of ordinary imports.
+`Performance` unique on `(eventId, artistId)` makes a manual entry and a later
+Setlist.fm import of the same set collapse into one row instead of forking.
 
 **SetlistSong**
-- `id`, `concertId`, `position` (int, ordering within the whole setlist)
+- `id`, `performanceId`, `position` (int, ordering within the whole set)
 - `name`, `info` (nullable, the per-song annotation Setlist.fm provides)
 - `isTape` (bool), `coverArtistName` (nullable), `encore` (int, 0 for main set)
 - A local copy of imported data. Never fetched live at render time.
 
+Songs belong to a Performance, not an Event. A festival day has one setlist per
+act, which is exactly what this gives you.
+
 ### 3.3 Personal layer
 
-**Attendance**
-- `id`, `userId`, `concertId`, `notes` (nullable), `rating` (nullable, 1 to 5)
+**Attendance** (you were at this night)
+- `id`, `userId`, `eventId`, `notes` (nullable), `rating` (nullable, 1 to 5)
 - `attendedWith` (nullable free text), `createdAt`
-- Unique on `(userId, concertId)`
+- Unique on `(userId, eventId)`
+
+**AttendedPerformance** (which acts you actually caught)
+- `attendanceId`, `performanceId`, `rating` (nullable), `notes` (nullable)
+- Unique on the pair
+
+This join table is what keeps stats honest. Without it, being at a 40 act
+festival would either credit you with seeing all 40 or with seeing none, and
+"most-seen artist" would be meaningless for anyone who goes to festivals. It
+also lets you rate the opener separately from the headliner, which is usually
+the interesting part of the night.
 
 **Photo**
-- `id`, `attendanceId`, `storageKey`, `width`, `height`
-- `caption` (nullable), `sortOrder`, `createdAt`
-- Belongs to Attendance, not Concert. Your photos stay yours even though the
-  setlist is shared.
+- `id`, `attendanceId`, `performanceId` (nullable), `storageKey`, `width`,
+  `height`, `caption` (nullable), `sortOrder`, `createdAt`
+- Belongs to your Attendance, so your photos stay yours even though the setlist
+  is shared. The optional `performanceId` tags a photo to a specific act, which
+  is what lets an artist page show photos of that artist.
 
-### 3.4 Festivals and openers (accepted simplification)
+### 3.4 Keeping the common case simple
 
-Setlist.fm models one setlist per artist per event. A `Concert` here follows
-that: it is one artist's performance, not the whole night. A user attending a
-festival or a show with openers logs each act separately. `Concert.eventName`
-groups them visually on a profile.
+The risk of this model is making a plain one band gig feel like filing paperwork.
+It does not, because the UI collapses it:
 
-Rejected alternative: a first-class `Event` entity with many performances. It
-roughly doubles the model and complicates dedup, import, and every query, to
-serve a minority of shows. Revisit if festival logging becomes a common
-complaint.
+- Logging a single artist show creates the Event, one Performance, the
+  Attendance, and one AttendedPerformance row in a single action. The user sees
+  one form and never encounters the word "performance".
+- The lineup picker appears only when the Event already has more than one
+  Performance, which is precisely the festival and opener case.
+- On a profile, an Attendance with one attended act renders as "Artist at Venue".
+  With several it renders as the event name and the acts you caught.
+
+Accepted cost: roughly one extra table and one extra join compared with the
+flat model, and imports now upsert two canonical rows instead of one. In
+exchange, festivals, openers, "who else was at this show", and per-artist stats
+all work correctly rather than approximately.
+
+**Multi-day festivals** are modeled as one Event per day sharing a
+`festivalName`, not as a single Event spanning a date range. You attend
+particular days, tickets are sold per day, and setlists are dated per day, so
+per-day events match reality and avoid a date-range type that every query would
+then have to reason about.
 
 ### 3.5 Social layer
 
@@ -122,10 +166,16 @@ cannot follow themselves.
 
 ### 3.6 Stats
 
-Computed on read by joining Attendance to Concert, Artist, Venue, and
-SetlistSong. No precomputed counter tables until a measured query is actually
-slow. Stats shown: total shows, shows per year, most-seen artists, top venues,
-most-heard songs, first and most recent show.
+Computed on read. No precomputed counter tables until a measured query is
+actually slow.
+
+The join path matters and is easy to get wrong: **artist and song statistics go
+through `AttendedPerformance`, never through `Event`.** Counting artists by way
+of the events you attended would credit you with every act on every festival
+bill you walked past. Venue and night-level statistics go through `Attendance`.
+
+Stats shown: total nights out, total sets seen, shows per year, most-seen
+artists, top venues, most-heard songs, first and most recent show.
 
 ## 4. Setlist.fm integration
 
@@ -145,7 +195,7 @@ most-heard songs, first and most recent show.
 The daily quota rules out any per-page-view call. Setlist.fm is contacted from
 exactly two places: an interactive search while a user is adding a show, and a
 budgeted background refresh job (4.6). Every result is copied into our own
-tables. Rendering a concert page, a profile, a feed, or a stats page issues zero
+tables. Rendering an event page, a profile, a feed, or a stats page issues zero
 external calls.
 
 The key lives in a server-side environment variable and is never sent to the
@@ -159,11 +209,19 @@ lets strangers exhaust the app's quota.
    endpoint returns full setlists including songs, so choosing a result normally
    costs one request total rather than two.
 3. User picks the matching show from the candidate list.
-4. Server upserts Artist, Venue, and Concert, writes SetlistSong rows, then
-   creates the Attendance.
-5. If a Concert with that `setlistfmId` already exists, steps 2 through 4 are
-   skipped entirely and only the Attendance is created. The second user to log a
-   popular show costs zero external calls.
+4. Server upserts, in order, Artist, Venue, Event (by `venueId` and `date`), and
+   Performance (by `eventId` and `artistId`), writes SetlistSong rows, then
+   creates the Attendance and its AttendedPerformance row.
+5. If a Performance with that `setlistfmId` already exists, steps 2 through 4
+   are skipped entirely and only the Attendance rows are created. The second
+   user to log a popular show costs zero external calls.
+
+Step 4 is where festivals fall out for free. Importing a second act from a night
+already in the database finds the existing Event on `(venueId, date)`, attaches
+a new Performance, and the lineup grows without anyone declaring that the night
+was a festival. After the import the user is shown the rest of that Event's
+lineup and can tick off the other acts they saw, which writes additional
+AttendedPerformance rows and costs no external calls at all.
 
 ### 4.4 Client guardrails
 
@@ -193,32 +251,34 @@ after a show while attendees correct the song order. A setlist that never
 updates therefore tends to be wrong exactly when people are looking at it. So
 setlists are refreshed, but on a strict budget rather than by naive polling.
 
-Every Concert stores `setlistfmVersionId` and `lastSyncedAt`. Refresh happens
-three ways:
+Every Performance stores `setlistfmVersionId` and `lastSyncedAt`. Refresh
+happens three ways:
 
-1. **Manual.** A "refresh setlist" button on any imported concert, drawing from
-   the `interactive` budget, rate limited per concert to once every 15 minutes
-   so it cannot be used to drain the quota.
+1. **Manual.** A "refresh setlist" button on any imported performance, drawing
+   from the `interactive` budget, rate limited per performance to once every 15
+   minutes so it cannot be used to drain the quota.
 2. **Scheduled, budgeted, and prioritized.** A daily job spends at most the
    `refresh` budget from 4.4 (20 percent of the daily quota, roughly 288 calls
-   on a starter key). It selects concerts by a decay rule rather than by
-   scanning everything: a show is eligible daily for its first week after the
-   event date, weekly until one month out, and never again automatically.
-   Within the eligible set it orders by attendee count descending, then by
-   oldest `lastSyncedAt`, so the quota is spent on the setlists the most people
-   are actually reading.
+   on a starter key). It selects performances by a decay rule rather than by
+   scanning everything: a performance is eligible daily for its first week after
+   the event date, weekly until one month out, and never again automatically.
+   Within the eligible set it orders by attended count descending (counted
+   through `AttendedPerformance`, not by event attendance, so a festival's
+   headliner outranks a side stage act), then by oldest `lastSyncedAt`, so the
+   quota is spent on the setlists the most people are actually reading.
 3. **Never on render.** No page view triggers a refresh, and no cache miss
    triggers one. Section 4.2 still holds.
 
 Because the decay rule stops at one month, the steady-state cost is bounded by
-how many shows the site logs per week, not by how many concerts exist in total.
+how many shows the site logs per week, not by how many performances exist in
+total.
 That is the property that makes this safe as the database grows, and it is the
 reason to prefer it over a "refresh anything older than N days" sweep, which
 grows without limit.
 
 If a refresh finds an unchanged `setlistfmVersionId`, nothing is written and
 only `lastSyncedAt` advances. If the version changed, songs are replaced in a
-single transaction so a concert page never renders a half-written setlist. If
+single transaction so a performance page never renders a half-written setlist. If
 the setlist was deleted upstream, the local copy is retained and flagged stale
 rather than destroyed, because a user's attendance record should not lose its
 setlist due to someone else's edit.
@@ -331,11 +391,12 @@ audit. A hidden UI control is not an access control.
 | --- | --- |
 | `/` | Feed of followed users' shows when signed in, marketing page otherwise |
 | `/u/[handle]` | Public profile: that user's shows plus a stats strip |
-| `/u/[handle]/shows/[id]` | One logged show: notes, photo gallery, setlist, comments |
-| `/shows/[id]` | Canonical concert: setlist, all attendees, all photos from that night |
+| `/u/[handle]/shows/[id]` | One logged night: notes, photo gallery, the acts they caught with each setlist, comments |
+| `/events/[id]` | Canonical night: full lineup, all attendees, all photos from that night |
+| `/events/[id]/[performanceId]` | One set: the setlist, who saw it, photos tagged to it |
 | `/add` | Setlist.fm search and import, with manual fallback |
-| `/artists/[id]` | Artist page with their concerts |
-| `/venues/[id]` | Venue page with its concerts |
+| `/artists/[id]` | Artist page: their performances, and photos tagged to them |
+| `/venues/[id]` | Venue page with its events |
 | `/settings` | Profile and account settings |
 | `/admin/reports` | Moderation queue, admin only |
 
@@ -367,7 +428,8 @@ Tests are written before implementation, per the normal development workflow.
 **Unit (Vitest)** on the logic most likely to fail quietly:
 - The `dd-MM-yyyy` date helper
 - The Setlist.fm response mapper (nested sets, encores, tapes, covers)
-- Concert dedup and upsert behavior
+- Event and Performance dedup and upsert behavior, including the festival case
+  where a second import attaches to an existing Event
 - EXIF stripping (assert no GPS tags survive)
 - Both storage drivers against the same interface contract
 - Signed URL expiry rounding: two calls inside the same 10 minute window must
@@ -385,16 +447,22 @@ would verify nothing.
 recorded response fixtures. A 1,440-call daily quota would not survive a test
 suite running in a loop.
 
-**End-to-end (Playwright)** on the two flows that must never break:
+**End-to-end (Playwright)** on the three flows that must never break:
 1. Sign up, then log a show via Setlist.fm import.
 2. Upload a photo, then view it on the public profile while signed out.
+3. The festival path: user A imports one act from a night, user B imports a
+   different act from the same night, and the second import attaches to user A's
+   Event rather than creating a second one. User B then ticks a third act from
+   the lineup, and their artist stats count exactly the two sets they marked as
+   seen, not the whole bill. This is the flow with the most ways to silently go
+   wrong, and it is the one a unit test cannot really cover.
 
 ## 10. Build order
 
 | Phase | Delivers |
 | --- | --- |
-| 1 | Auth, schema, manual show logging, public profiles |
-| 2 | Setlist.fm search and import, concert pages |
+| 1 | Auth, schema (Event, Performance, Attendance, AttendedPerformance), manual show logging, public profiles |
+| 2 | Setlist.fm search and import, event and performance pages, lineup picker |
 | 3 | Photo upload and galleries |
 | 4 | Stats |
 | 5 | Follow, feed, comments, likes, moderation |
