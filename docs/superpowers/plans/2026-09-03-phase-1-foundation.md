@@ -17,6 +17,7 @@
 - `next-auth` v5 is published under the `beta` dist-tag. `latest` is the v4 line and is NOT compatible with the App Router setup in this plan. Always install it as `next-auth@5.0.0-beta.32`.
 - Prisma 8 exists only as a release candidate. Do not use it.
 - Every mutation verifies ownership server-side via `requireOwner` (spec 6.2). A hidden UI control is not an access control.
+- **A `"use server"` module may export only async functions, and every export it has becomes a public HTTP endpoint.** Therefore no function taking a `userId` (or any other caller-supplied identity) may be exported from one, and no schema, type, or constant may be either. Testable cores taking an explicit `userId` live in `src/domain/`; action modules hold only thin wrappers that derive the user from the session via `requireUser()`. Violating this is a privilege-escalation bug, not a style preference.
 - Every route handler and server action validates input with Zod at the boundary (spec 7).
 - Dates are stored as PostgreSQL `DATE` with no time component (spec 3.2). Never store a show date as a timestamp; timezone drift silently moves shows to the wrong day.
 - No em dashes in user-facing copy, comments, or docs. Use periods, commas, colons, or parentheses.
@@ -69,6 +70,8 @@ This plan therefore adds a normalized `nameKey` column to both:
 | `src/lib/handle.ts` | Handle validation and reserved names |
 | `src/domain/log-show.ts` | `logShow`, the one place a show gets recorded |
 | `src/domain/describe-attendance.ts` | `describeAttendance`, the single vs multi act display rule |
+| `src/domain/claim-handle.ts` | `claimHandleFor`, handle claiming core (takes an explicit userId, so not an action) |
+| `src/domain/submit-show.ts` | `addShowSchema` and `submitShow`, manual entry core (same reason) |
 | `src/auth.ts` | Auth.js configuration and exports |
 | `src/lib/authz.ts` | `requireUser`, `requireOwner` |
 | `src/app/api/auth/[...nextauth]/route.ts` | Auth.js route handlers |
@@ -108,7 +111,7 @@ If it refuses because the directory is not empty, that is expected (the repo alr
 
 ```bash
 npm install prisma@7.10.0 @prisma/client@7.10.0 next-auth@5.0.0-beta.32 @auth/prisma-adapter@2.11.3 zod@4.5.4 nodemailer@7.0.4
-npm install -D vitest@5.0.0 @playwright/test@1.62.1 tsx@4.23.13 dotenv@17.2.3
+npm install -D vitest@5.0.0 @playwright/test@1.62.1 tsx@4.23.13 dotenv@17.2.3 dotenv-cli@10.0.0
 ```
 
 - [ ] **Step 3: Add the Vitest config**
@@ -471,10 +474,20 @@ Then create the test database and apply the same migration to it:
 
 ```bash
 docker compose exec db psql -U concert -d concert -c "CREATE DATABASE concert_test;"
-npx dotenv -e .env.test -- prisma migrate deploy
+npx dotenv-cli -e .env.test -- npx prisma migrate deploy
 ```
 
-If `dotenv` CLI is unavailable, set `DATABASE_URL` inline for that one command instead.
+`dotenv-cli` is the command line tool; the `dotenv` package is the library and provides no binary. If the wrapper misbehaves, the inline form works in Git Bash:
+
+```bash
+DATABASE_URL="postgresql://concert:concert@localhost:5433/concert_test?schema=public" npx prisma migrate deploy
+```
+
+Add a script for repeat use, since the test database needs re-migrating after every schema change:
+
+```json
+"db:test:migrate": "dotenv -e .env.test -- prisma migrate deploy"
+```
 
 - [ ] **Step 6: Add the Prisma singleton**
 
@@ -1567,15 +1580,12 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 Create `src/app/api/auth/[...nextauth]/route.ts`:
 
 ```ts
-export { GET, POST } from "@/auth";
-```
-
-Note: `handlers` is an object with `GET` and `POST`. If the re-export above does not type-check in this Auth.js beta, use the explicit form instead:
-
-```ts
 import { handlers } from "@/auth";
+
 export const { GET, POST } = handlers;
 ```
+
+`src/auth.ts` exports `handlers` as an object holding `GET` and `POST`. It does not export `GET` and `POST` as top-level names, so a bare `export { GET, POST } from "@/auth"` does not resolve. Destructure as above.
 
 Create `src/types/next-auth.d.ts`:
 
@@ -1762,13 +1772,21 @@ git commit -m "Add Auth.js configuration and ownership helpers"
 ### Task 8: Handle onboarding
 
 **Files:**
+- Create: `src/domain/claim-handle.ts`
 - Create: `src/app/onboarding/page.tsx`, `src/app/onboarding/actions.ts`
 - Create: `src/app/login/page.tsx`
 - Test: `tests/app/onboarding.test.ts`
 
 **Interfaces:**
 - Consumes: `handleSchema` (Task 6), `requireUser` (Task 7), `prisma` (Task 2)
-- Produces: `claimHandle(formData: FormData): Promise<{ error: string } | never>`
+- Produces: `claimHandleFor(userId: string, raw: string): Promise<ClaimResult>` from `@/domain/claim-handle`; `claimHandle(prev, formData)` from the actions module
+
+**Critical structural rule for this task and Task 9.** Every export of a `"use server"` module becomes a publicly callable HTTP endpoint, and Next.js additionally requires every such export to be an async function. Therefore:
+
+- A function taking a `userId` parameter must NEVER live in a `"use server"` module. Exporting `claimHandleFor(userId, handle)` from one would let anyone on the internet set any user's handle by calling it directly with someone else's id.
+- Non-async exports (Zod schemas, types, constants) break the build there.
+
+So the testable core lives in `src/domain/`, which is a plain module, and the action module holds only thin wrappers that derive the user from the session themselves. Tests import the core from `@/domain/`.
 
 A new user has `handle: null` until they choose one. Until then they have no profile URL, so they are redirected here.
 
@@ -1789,7 +1807,7 @@ vi.mock("next/navigation", () => ({
   },
 }));
 
-const { claimHandleFor } = await import("@/app/onboarding/actions");
+const { claimHandleFor } = await import("@/domain/claim-handle");
 
 beforeEach(async () => {
   await resetDb();
@@ -1866,25 +1884,22 @@ describe("claimHandleFor", () => {
 - [ ] **Step 2: Run and confirm it fails**
 
 Run: `npm test tests/app/onboarding.test.ts`
-Expected: FAIL, cannot resolve the actions module.
+Expected: FAIL, cannot resolve `@/domain/claim-handle`.
 
-- [ ] **Step 3: Implement the action**
+- [ ] **Step 3: Implement the core**
 
-Create `src/app/onboarding/actions.ts`:
+Create `src/domain/claim-handle.ts` (a plain module, NOT a server action file):
 
 ```ts
-"use server";
-
-import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db";
 import { handleSchema } from "@/lib/handle";
-import { requireUser } from "@/lib/authz";
 
 export type ClaimResult = { ok: true; handle: string } | { ok: false; error: string };
 
 /**
- * Testable core. Separated from the form action so tests do not have to
- * simulate a FormData round trip.
+ * Testable core. It takes an explicit userId, which is exactly why it must
+ * not live in a "use server" module: that would expose it as an endpoint
+ * anyone could call with someone else's user id.
  */
 export async function claimHandleFor(userId: string, raw: string): Promise<ClaimResult> {
   const parsed = handleSchema.safeParse(raw);
@@ -1911,7 +1926,19 @@ export async function claimHandleFor(userId: string, raw: string): Promise<Claim
 
   return { ok: true, handle };
 }
+```
 
+Then create `src/app/onboarding/actions.ts`, holding only the wrapper:
+
+```ts
+"use server";
+
+import { redirect } from "next/navigation";
+import { requireUser } from "@/lib/authz";
+import { claimHandleFor, type ClaimResult } from "@/domain/claim-handle";
+
+// The only export, and it derives the user from the session rather than
+// accepting a user id from the caller.
 export async function claimHandle(
   _prev: ClaimResult | null,
   formData: FormData,
@@ -1924,6 +1951,13 @@ export async function claimHandle(
 }
 ```
 
+The page imports its result type from the domain module, not the action module:
+
+```ts
+import { claimHandle } from "./actions";
+import type { ClaimResult } from "@/domain/claim-handle";
+```
+
 - [ ] **Step 4: Implement the pages**
 
 Create `src/app/onboarding/page.tsx`:
@@ -1932,7 +1966,8 @@ Create `src/app/onboarding/page.tsx`:
 "use client";
 
 import { useActionState } from "react";
-import { claimHandle, type ClaimResult } from "./actions";
+import { claimHandle } from "./actions";
+import type { ClaimResult } from "@/domain/claim-handle";
 
 export default function OnboardingPage() {
   const [state, action, pending] = useActionState<ClaimResult | null, FormData>(
@@ -2013,12 +2048,15 @@ git commit -m "Add sign in and handle onboarding"
 ### Task 9: Manual show entry
 
 **Files:**
+- Create: `src/domain/submit-show.ts`
 - Create: `src/app/add/page.tsx`, `src/app/add/actions.ts`
 - Test: `tests/app/add-show.test.ts`
 
 **Interfaces:**
 - Consumes: `logShow` (Task 4), `requireUser` (Task 7)
-- Produces: `addShowSchema`, `submitShow(input: unknown, userId: string)`
+- Produces: `addShowSchema`, `submitShow(input: unknown, userId: string)`, `AddShowResult` from `@/domain/submit-show`; `addShow(prev, formData)` from the actions module
+
+The same structural rule as Task 8 applies, for the same two reasons. `addShowSchema` is a Zod object, and a non-async export breaks the build of a `"use server"` module. `submitShow` takes a `userId`, so exporting it from one would let anyone log shows onto any account. Both live in `src/domain/submit-show.ts`; the action module exports only `addShow`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2037,7 +2075,7 @@ vi.mock("next/navigation", () => ({
 }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
-const { submitShow, addShowSchema } = await import("@/app/add/actions");
+const { submitShow, addShowSchema } = await import("@/domain/submit-show");
 
 beforeEach(resetDb);
 afterAll(async () => {
@@ -2118,20 +2156,15 @@ describe("submitShow", () => {
 - [ ] **Step 2: Run and confirm it fails**
 
 Run: `npm test tests/app/add-show.test.ts`
-Expected: FAIL, cannot resolve the actions module.
+Expected: FAIL, cannot resolve `@/domain/submit-show`.
 
-- [ ] **Step 3: Implement the action**
+- [ ] **Step 3: Implement the core**
 
-Create `src/app/add/actions.ts`:
+Create `src/domain/submit-show.ts` (a plain module, NOT a server action file):
 
 ```ts
-"use server";
-
 import { z } from "zod";
-import { redirect } from "next/navigation";
-import { revalidatePath } from "next/cache";
 import { logShow } from "@/domain/log-show";
-import { requireUser } from "@/lib/authz";
 
 const today = () => new Date().toISOString().slice(0, 10);
 
@@ -2158,7 +2191,8 @@ export type AddShowResult =
   | { ok: false; error: string };
 
 /**
- * Testable core: takes plain input and an explicit user id.
+ * Testable core: takes plain input and an explicit user id, which is why it
+ * lives here rather than in the server action module.
  */
 export async function submitShow(input: unknown, userId: string): Promise<AddShowResult> {
   const parsed = addShowSchema.safeParse(input);
@@ -2186,12 +2220,29 @@ export async function submitShow(input: unknown, userId: string): Promise<AddSho
 
   return { ok: true, attendanceId: result.attendanceId };
 }
+```
 
+Then create `src/app/add/actions.ts`, holding only the wrapper:
+
+```ts
+"use server";
+
+import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
+import { requireUser } from "@/lib/authz";
+import { submitShow, type AddShowResult } from "@/domain/submit-show";
+
+// The only export. It derives the user from the session, so the caller
+// cannot name a user id.
 export async function addShow(
   _prev: AddShowResult | null,
   formData: FormData,
 ): Promise<AddShowResult> {
   const user = await requireUser();
+
+  // A user who has not claimed a handle has no profile URL to redirect to,
+  // and "/u/null" would be a dead link. Send them to pick one first.
+  if (!user.handle) redirect("/onboarding");
 
   const result = await submitShow(Object.fromEntries(formData), user.id);
 
@@ -2212,7 +2263,8 @@ Create `src/app/add/page.tsx`:
 "use client";
 
 import { useActionState } from "react";
-import { addShow, type AddShowResult } from "./actions";
+import { addShow } from "./actions";
+import type { AddShowResult } from "@/domain/submit-show";
 
 export default function AddShowPage() {
   const [state, action, pending] = useActionState<AddShowResult | null, FormData>(
