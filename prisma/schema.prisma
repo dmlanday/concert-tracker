@@ -1,0 +1,179 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------- Auth.js ----------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  handle        String?   @unique
+  bio           String?
+  isAdmin       Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+
+  accounts    Account[]
+  sessions    Session[]
+  attendances Attendance[]
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+}
+
+// ---------- Canonical layer (spec 3.2) ----------
+
+model Artist {
+  id       String  @id @default(cuid())
+  name     String
+  nameKey  String  @unique
+  mbid     String? @unique
+  imageUrl String?
+
+  performances Performance[]
+}
+
+model Venue {
+  id               String  @id @default(cuid())
+  name             String
+  nameKey          String
+  city             String
+  state            String?
+  country          String
+  setlistfmVenueId String? @unique
+  lat              Float?
+  lng              Float?
+
+  events Event[]
+
+  @@unique([nameKey, city, country])
+}
+
+model Event {
+  id           String   @id @default(cuid())
+  venueId      String
+  date         DateTime @db.Date
+  name         String?
+  festivalName String?
+  createdAt    DateTime @default(now())
+
+  venue        Venue         @relation(fields: [venueId], references: [id])
+  performances Performance[]
+  attendances  Attendance[]
+
+  @@unique([venueId, date])
+  @@index([date])
+}
+
+enum Billing {
+  headliner
+  support
+  unknown
+}
+
+model Performance {
+  id                 String    @id @default(cuid())
+  eventId            String
+  artistId           String
+  billing            Billing   @default(unknown)
+  setOrder           Int?
+  tourName           String?
+  setlistfmId        String?   @unique
+  setlistfmVersionId String?
+  lastSyncedAt       DateTime?
+
+  event    Event                 @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  artist   Artist                @relation(fields: [artistId], references: [id])
+  songs    SetlistSong[]
+  attended AttendedPerformance[]
+
+  @@unique([eventId, artistId])
+}
+
+model SetlistSong {
+  id              String  @id @default(cuid())
+  performanceId   String
+  position        Int
+  name            String
+  info            String?
+  isTape          Boolean @default(false)
+  coverArtistName String?
+  encore          Int     @default(0)
+
+  performance Performance @relation(fields: [performanceId], references: [id], onDelete: Cascade)
+
+  @@unique([performanceId, position])
+}
+
+// ---------- Personal layer (spec 3.3) ----------
+
+model Attendance {
+  id           String   @id @default(cuid())
+  userId       String
+  eventId      String
+  notes        String?
+  rating       Int?
+  attendedWith String?
+  createdAt    DateTime @default(now())
+
+  user     User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event    Event                 @relation(fields: [eventId], references: [id])
+  attended AttendedPerformance[]
+
+  @@unique([userId, eventId])
+  @@index([userId, createdAt])
+}
+
+model AttendedPerformance {
+  attendanceId  String
+  performanceId String
+  rating        Int?
+  notes         String?
+
+  attendance  Attendance  @relation(fields: [attendanceId], references: [id], onDelete: Cascade)
+  performance Performance @relation(fields: [performanceId], references: [id], onDelete: Cascade)
+
+  @@id([attendanceId, performanceId])
+}
