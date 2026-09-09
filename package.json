@@ -2,6 +2,7 @@
   "name": "concert-tracker",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -9,6 +10,7 @@
     "lint": "eslint",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test",
     "db:test:migrate": "dotenv -e .env.test -- prisma migrate deploy"
   },
   "dependencies": {
