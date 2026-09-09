@@ -18,7 +18,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   callbacks: {
     session({ session, user }) {
       session.user.id = user.id;
-      session.user.handle = (user as { handle: string | null }).handle;
+      session.user.handle =
+        (user as unknown as { handle?: string | null }).handle ?? null;
       return session;
     },
   },
